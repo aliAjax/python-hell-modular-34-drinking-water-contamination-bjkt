@@ -2,7 +2,7 @@ import json
 import mimetypes
 import os
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from .domain import DomainError
 
@@ -58,6 +58,12 @@ def build_handler(service, static_dir):
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
+                if len(parts) == 5 and parts[:2] == ["api", "items"] and parts[3] == "offline" and parts[4] == "batches":
+                    return self._send(200, {"batches": service.list_offline_batches(int(parts[2]))})
+                if parts == ["api", "offline", "batches"]:
+                    query = parse_qs(urlparse(self.path).query)
+                    status_filter = (query.get("status") or [None])[0]
+                    return self._send(200, {"batches": service.list_offline_batches(status=status_filter)})
                 if path == "/":
                     file_path = os.path.join(static_dir, "index.html")
                     with open(file_path, "rb") as handle:
@@ -86,6 +92,15 @@ def build_handler(service, static_dir):
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                if len(parts) == 5 and parts[:2] == ["api", "items"] and parts[3] == "offline":
+                    if parts[4] == "flush":
+                        return self._send(201, service.register_offline_flush(int(parts[2]), payload, actor, role, region))
+                    if parts[4] == "sample":
+                        return self._send(201, service.register_offline_sample(int(parts[2]), payload, actor, role, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "replay":
+                    return self._send(200, {"results": service.replay_pending(int(parts[2]))})
+                if parts == ["api", "offline", "replay"]:
+                    return self._send(200, {"results": service.replay_pending()})
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)

@@ -1,3 +1,5 @@
+import uuid
+
 from .domain import DomainError
 
 ENTITY_TYPE = "water_contamination"
@@ -14,9 +16,32 @@ ACTION_ROLES = {
     "restore": {"coordinator", "regulator"},
     "cancel": {"coordinator"},
 }
+# 离线补录沿用对应在线操作的权限
+OFFLINE_ROLES = {
+    "flush": ACTION_ROLES["flush"],
+    "sample": ACTION_ROLES["sample"],
+    "source": SOURCE_ROLES,
+}
 ENFORCE_REGION = False
 REGION_SENSITIVE_ACTIONS = set()
 ACTION_REQUIRES_VERSION = {"advise", "switch_source", "flush", "disinfect", "sample", "restore", "cancel"}
+
+ALLOWED_STATUS = {
+    "verify": {"detected", "verified"},
+    "advise": {"verified", "advisory"},
+    "switch_source": {"verified", "advisory", "flushing", "disinfected", "sampled", "switched"},
+    "flush": {"advisory", "flushing", "switched"},
+    "disinfect": {"flushing", "disinfected"},
+    "sample": {"disinfected", "sampled"},
+    "restore": {"sampled"},
+    "cancel": {"detected", "verified"},
+}
+
+
+def require_status_for(action, status):
+    allowed = ALLOWED_STATUS.get(action)
+    if allowed is not None and status not in allowed:
+        raise DomainError("invalid_state", "当前状态 %s 不允许执行该操作" % status)
 
 
 def assess(payload):
@@ -83,9 +108,9 @@ def apply_action(item, action, payload, actor, role):
 
     if action == "flush":
         _need_status(item, {"advisory", "flushing", "switched"})
-        zone_id = _text(payload, "zone_id")
-        current.setdefault("response_actions", []).append({"type": "flush", "zone_id": zone_id})
-        return "flushing", current, {"zone_id": zone_id, "type": "flush"}
+        flush_record = build_flush_record(payload)
+        current.setdefault("response_actions", []).append(flush_record)
+        return "flushing", current, {"zone_id": flush_record["zone_id"], "type": "flush", "record_id": flush_record["record_id"]}
 
     if action == "disinfect":
         _need_status(item, {"flushing", "disinfected"})
@@ -97,13 +122,7 @@ def apply_action(item, action, payload, actor, role):
 
     if action == "sample":
         _need_status(item, {"disinfected", "sampled"})
-        result = {
-            "sample_id": _text(payload, "sample_id"),
-            "zone_id": _text(payload, "zone_id"),
-            "concentration": float(payload.get("concentration", 0)),
-        }
-        if result["concentration"] < 0:
-            raise DomainError("invalid_concentration", "浓度不能为负数")
+        result = build_sample_record(payload)
         current.setdefault("sample_results", []).append(result)
         return "sampled", current, {"sample_result": result}
 
@@ -125,3 +144,97 @@ def apply_action(item, action, payload, actor, role):
         return "cancelled", current, {"reason": reason}
 
     raise DomainError("unknown_action", "不支持的操作")
+
+
+def _record_id(payload, prefix):
+    value = payload.get("record_id")
+    if value is None:
+        return "%s-%s" % (prefix, uuid.uuid4().hex[:12])
+    if not isinstance(value, str) or not value.strip():
+        raise DomainError("invalid_record_id", "record_id 必须是非空字符串")
+    return value.strip()
+
+
+def build_flush_record(payload):
+    """构造带稳定编号的冲洗记录；编号用于离线重放时去重。"""
+    return {
+        "type": "flush",
+        "record_id": _record_id(payload, "flush"),
+        "zone_id": _text(payload, "zone_id"),
+        "recorded_at": _text(payload, "recorded_at") if "recorded_at" in payload else None,
+        "note": payload.get("note", ""),
+    }
+
+
+def build_sample_record(payload):
+    """构造带稳定编号的化验复检记录，编号用于离线重放时去重。"""
+    result = {
+        "record_id": _record_id(payload, "sample"),
+        "sample_id": _text(payload, "sample_id"),
+        "zone_id": _text(payload, "zone_id"),
+        "concentration": float(payload.get("concentration", 0)),
+        "recorded_at": _text(payload, "recorded_at") if "recorded_at" in payload else None,
+    }
+    if result["concentration"] < 0:
+        raise DomainError("invalid_concentration", "浓度不能为负数")
+    return result
+
+
+def _flush_index(payload):
+    index = {}
+    for record in payload.get("response_actions", []):
+        if record.get("type") == "flush":
+            index.setdefault(record.get("zone_id"), []).append(record)
+    return index
+
+
+def merge_flush_records(base_payload, current_payload, offline_payload):
+    """三路合并离线冲洗补录。
+
+    以班组离线时所依据的原始版本 base_payload 为基准，只提取离线期间
+    现场新增的管网冲洗记录；服务端当前版本中其他班组对其他管网区的
+    冲洗记录原样保留，互不覆盖。
+    """
+    base_by_zone = _flush_index(base_payload)
+    current_by_zone = _flush_index(current_payload)
+
+    merged = dict(current_payload)
+    actions = [dict(record) for record in current_payload.get("response_actions", [])]
+    merged["response_actions"] = actions
+
+    merged_zones = []
+    skipped = []
+    for record in offline_payload.get("response_actions", []):
+        if record.get("type") != "flush":
+            continue
+        zone_id = record.get("zone_id")
+        record_id = record.get("record_id")
+        existing_ids = {item.get("record_id") for item in current_by_zone.get(zone_id, [])}
+        if record_id in existing_ids:
+            # 重放的同一批记录已写入过，不能重复写
+            skipped.append({"zone_id": zone_id, "record_id": record_id, "reason": "already_applied"})
+            continue
+        base_records = base_by_zone.get(zone_id, [])
+        if record_id in {item.get("record_id") for item in base_records}:
+            # 该记录在原始版本里已存在，不属于离线新增
+            skipped.append({"zone_id": zone_id, "record_id": record_id, "reason": "present_in_base"})
+            continue
+        actions.append(dict(record))
+        current_by_zone.setdefault(zone_id, []).append(record)
+        merged_zones.append({"zone_id": zone_id, "record_id": record_id})
+
+    status = "flushing" if merged_zones else None
+    return merged, {"merged": merged_zones, "skipped": skipped}
+
+
+def offline_sample_duplicated(current_payload, record):
+    return any(
+        existing.get("record_id") == record.get("record_id") or existing.get("sample_id") == record.get("sample_id")
+        for existing in current_payload.get("sample_results", [])
+    )
+
+
+def merge_sample_record(current_payload, record):
+    merged = dict(current_payload)
+    merged["sample_results"] = list(current_payload.get("sample_results", [])) + [dict(record)]
+    return merged

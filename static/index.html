@@ -1,5 +1,12 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>使用 JSON API 创建污染事件、登记水源或管网记录，并完成复检、通知、冲洗、消毒和恢复。</p><pre>GET /health
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>使用 JSON API 创建污染事件、登记水源或管网记录，并完成复检、通知、冲洗、消毒和恢复。巡查组断网期间的离线冲洗/化验记录可按原始 expected_version 补录，系统按管网区三路合并、保序重放并保留双版本审计。</p><pre>GET /health
 GET /api/state
 POST /api/items
 POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+POST /api/items/{id}/actions
+POST /api/items/{id}/offline/flush      离线冲洗补录（expected_version + records[]）
+POST /api/items/{id}/offline/sample     离线化验补录（不合格拒绝写入）
+POST /api/items/{id}/replay             按登记顺序重放待重试批次
+POST /api/offline/replay                重放所有事件的待重试批次
+GET  /api/items/{id}/offline/batches
+GET  /api/offline/batches?status=pending
+GET  /api/items/{id}/audit</pre></body></html>
