@@ -2,7 +2,7 @@ import json
 import mimetypes
 import os
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .domain import DomainError
 
@@ -28,6 +28,9 @@ def build_handler(service, static_dir):
                 return json.loads(self.rfile.read(length).decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 raise DomainError("invalid_json", "请求体不是有效 JSON", 400)
+
+        def _query(self):
+            return parse_qs(urlparse(self.path).query)
 
         def _send(self, status, value, content_type="application/json; charset=utf-8"):
             if not isinstance(value, (bytes, bytearray)):
@@ -58,6 +61,9 @@ def build_handler(service, static_dir):
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "offline-records":
+                    status = self._query().get("status", [None])[0]
+                    return self._send(200, {"records": service.list_offline_records(int(parts[2]), status)})
                 if path == "/":
                     file_path = os.path.join(static_dir, "index.html")
                     with open(file_path, "rb") as handle:
@@ -86,6 +92,11 @@ def build_handler(service, static_dir):
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "offline-records":
+                    records = payload.get("records", [])
+                    return self._send(200, service.submit_offline_records(int(parts[2]), records, actor, role, region))
+                if len(parts) == 5 and parts[:2] == ["api", "items"] and parts[3] == "offline-records" and parts[4] == "replay":
+                    return self._send(200, service.replay_offline_records(int(parts[2]), actor, role, region))
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)

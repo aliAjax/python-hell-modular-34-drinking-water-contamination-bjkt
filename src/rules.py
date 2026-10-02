@@ -1,3 +1,5 @@
+import copy
+
 from .domain import DomainError
 
 ENTITY_TYPE = "water_contamination"
@@ -104,6 +106,8 @@ def apply_action(item, action, payload, actor, role):
         }
         if result["concentration"] < 0:
             raise DomainError("invalid_concentration", "浓度不能为负数")
+        if result["concentration"] > float(current.get("limit", 0)):
+            raise DomainError("quality_not_met", "复检结果未达到限值，拒绝写入", 409)
         current.setdefault("sample_results", []).append(result)
         return "sampled", current, {"sample_result": result}
 
@@ -125,3 +129,46 @@ def apply_action(item, action, payload, actor, role):
         return "cancelled", current, {"reason": reason}
 
     raise DomainError("unknown_action", "不支持的操作")
+
+
+def _record_natural_key(action, record):
+    """同一业务记录的自然键，用于离线补录合并时去重，避免重复冲洗/重复采样。"""
+    if action == "flush":
+        return ("response_actions", "flush", record.get("zone_id"))
+    if action == "disinfect":
+        return ("response_actions", "disinfect", record.get("zone_id"))
+    if action == "sample":
+        return ("sample_results", None, record.get("sample_id"))
+    return None
+
+
+def merge_action(item, action, payload, actor, role):
+    """离线补录合并：按当前版本重放现场记录，而不是用旧快照整体覆盖。
+
+    不同管网区的冲洗/消毒记录各自保留；同一自然键的重复记录只保留一份。
+    返回 (new_status, new_payload, merged_payload)。
+    """
+    if action not in ACTION_ROLES:
+        raise DomainError("unknown_action", "不支持的操作")
+    if role not in ACTION_ROLES[action]:
+        raise DomainError("forbidden", "当前角色不能执行该操作", 403)
+    work = {"status": item["status"], "payload": copy.deepcopy(item["payload"])}
+    new_status, new_payload, event_payload = apply_action(work, action, payload, actor, role)
+    key = _record_natural_key(action, event_payload)
+    if key is not None:
+        field, type_value, key_value = key
+        if key_value is not None:
+            before = item["payload"].get(field, [])
+
+            def matches(entry):
+                if type_value is None:
+                    return entry.get("sample_id") == key_value
+                return entry.get("type") == type_value and entry.get("zone_id") == key_value
+
+            if any(matches(entry) for entry in before):
+                records = new_payload.get(field, [])
+                for index in range(len(records) - 1, -1, -1):
+                    if matches(records[index]):
+                        del records[index]
+                        break
+    return new_status, new_payload, event_payload

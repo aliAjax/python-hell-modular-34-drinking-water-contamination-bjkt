@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+from . import rules
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
 
@@ -69,6 +70,26 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS offline_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    client_record_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    expected_version INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    original_json TEXT NOT NULL,
+                    merged_json TEXT,
+                    version_before INTEGER,
+                    version_after INTEGER,
+                    recorded_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    applied_at TEXT,
+                    UNIQUE(item_id, client_record_id),
+                    FOREIGN KEY(item_id) REFERENCES items(id)
                 );
                 """
             )
@@ -257,5 +278,169 @@ class Repository:
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
             return {"counts": counts, "items": self.list_items()}
+        finally:
+            conn.close()
+
+    def _apply_one_offline(self, conn, item_row, rec, actor, role):
+        item_id = item_row["id"]
+        client_id = rec.get("client_record_id")
+        action = rec.get("action")
+        payload = rec.get("payload") or {}
+        expected_version = rec.get("expected_version")
+        recorded_at = rec.get("recorded_at") or now_iso()
+        original = {
+            "client_record_id": client_id,
+            "action": action,
+            "payload": payload,
+            "expected_version": expected_version,
+            "recorded_at": recorded_at,
+        }
+        existing = conn.execute(
+            "SELECT * FROM offline_records WHERE item_id=? AND client_record_id=?",
+            (item_id, client_id),
+        ).fetchone()
+        if existing is not None and existing["status"] == "applied":
+            return {"bucket": "skipped", "client_record_id": client_id, "id": existing["id"]}
+
+        item = self._row_to_item(item_row)
+        version_before = int(item["version"])
+        try:
+            new_status, new_payload, merged = rules.merge_action(item, action, payload, actor, role)
+        except DomainError as exc:
+            attempts = (existing["attempts"] if existing else 0) + 1
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO offline_records(item_id,client_record_id,action,payload,expected_version,status,attempts,last_error,original_json,recorded_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (item_id, client_id, action, canonical_json(payload), expected_version, "pending", attempts, exc.code, canonical_json(original), recorded_at, now_iso()),
+                )
+                rec_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            else:
+                conn.execute(
+                    "UPDATE offline_records SET status='pending', attempts=?, last_error=? WHERE id=?",
+                    (attempts, exc.code, existing["id"]),
+                )
+                rec_id = existing["id"]
+            self.append_audit(
+                conn,
+                item_id,
+                "offline_record_rejected",
+                actor,
+                role,
+                {"client_record_id": client_id, "action": action, "original": original, "error": exc.code, "message": str(exc)},
+            )
+            return {"bucket": "pending", "client_record_id": client_id, "id": rec_id, "error": exc.code}
+
+        version_after = version_before + 1
+        conn.execute(
+            "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+            (new_status, version_after, canonical_json(new_payload), now_iso(), item_id),
+        )
+        conn.execute(
+            "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+            (item_id, action, actor, role, canonical_json(merged), now_iso()),
+        )
+        if existing is None:
+            conn.execute(
+                "INSERT INTO offline_records(item_id,client_record_id,action,payload,expected_version,status,attempts,last_error,original_json,merged_json,version_before,version_after,recorded_at,created_at,applied_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (item_id, client_id, action, canonical_json(payload), expected_version, "applied", 1, None, canonical_json(original), canonical_json(merged), version_before, version_after, recorded_at, now_iso(), now_iso()),
+            )
+            rec_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        else:
+            conn.execute(
+                "UPDATE offline_records SET status='applied', attempts=?, last_error=NULL, merged_json=?, version_before=?, version_after=?, applied_at=? WHERE id=?",
+                (existing["attempts"] + 1, canonical_json(merged), version_before, version_after, now_iso(), existing["id"]),
+            )
+            rec_id = existing["id"]
+        self.append_audit(
+            conn,
+            item_id,
+            "offline_record_applied",
+            actor,
+            role,
+            {
+                "client_record_id": client_id,
+                "action": action,
+                "original": original,
+                "merged": merged,
+                "version_before": version_before,
+                "version_after": version_after,
+            },
+        )
+        return {"bucket": "applied", "client_record_id": client_id, "id": rec_id, "version_after": version_after}
+
+    def submit_offline_records(self, item_id, records, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item_row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if item_row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            summary = {"applied": [], "pending": [], "skipped": []}
+            for rec in records:
+                result = self._apply_one_offline(conn, item_row, rec, actor, role)
+                summary[result["bucket"]].append(result)
+                if result["bucket"] == "applied":
+                    item_row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            conn.execute("COMMIT")
+            return summary
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def list_offline_records(self, item_id, status=None):
+        conn = self.connect()
+        try:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM offline_records WHERE item_id=? AND status=? ORDER BY id",
+                    (item_id, status),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM offline_records WHERE item_id=? ORDER BY id",
+                    (item_id,),
+                ).fetchall()
+            result = []
+            for row in rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"]) if value["payload"] else None
+                value["original"] = json.loads(value["original_json"])
+                value["merged"] = json.loads(value["merged_json"]) if value["merged_json"] else None
+                result.append(value)
+            return result
+        finally:
+            conn.close()
+
+    def replay_offline_records(self, item_id, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            item_row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if item_row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            rows = conn.execute(
+                "SELECT * FROM offline_records WHERE item_id=? AND status='pending' ORDER BY id",
+                (item_id,),
+            ).fetchall()
+            summary = {"applied": [], "pending": [], "skipped": []}
+            for row in rows:
+                rec = json.loads(row["original_json"])
+                result = self._apply_one_offline(conn, item_row, rec, actor, role)
+                summary[result["bucket"]].append(result)
+                if result["bucket"] == "applied":
+                    item_row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            conn.execute("COMMIT")
+            return summary
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()

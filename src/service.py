@@ -1,6 +1,8 @@
 from . import domain, rules
 from .domain import DomainError
 
+OFFLINE_SUBMIT_ROLES = {"field_operator", "lab"}
+
 
 class Service:
     def __init__(self, repository):
@@ -67,3 +69,27 @@ class Service:
 
     def state(self):
         return self.repository.state_summary()
+
+    def submit_offline_records(self, item_id, records, actor, role, region=None):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        if role not in OFFLINE_SUBMIT_ROLES:
+            raise DomainError("forbidden", "当前角色不能提交离线补录记录", 403)
+        if not isinstance(records, list) or not records:
+            raise DomainError("records_required", "至少需要一条离线补录记录")
+        for rec in records:
+            if not isinstance(rec, dict):
+                raise DomainError("invalid_record", "离线补录记录必须是对象")
+            if not isinstance(rec.get("client_record_id"), str) or not rec["client_record_id"].strip():
+                raise DomainError("client_record_id_required", "每条离线补录记录需要 client_record_id")
+            if not isinstance(rec.get("action"), str) or not rec["action"].strip():
+                raise DomainError("action_required", "每条离线补录记录需要 action")
+        return self.repository.submit_offline_records(item_id, records, actor, role)
+
+    def list_offline_records(self, item_id, status=None):
+        return self.repository.list_offline_records(item_id, status)
+
+    def replay_offline_records(self, item_id, actor, role, region=None):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        return self.repository.replay_offline_records(item_id, actor, role)
